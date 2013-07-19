@@ -26,6 +26,7 @@
 
 #include <linux/videodev2.h>
 #include <linux/v4l2-subdev.h>
+#include <linux/v4l2-mediabus.h>
 
 #define N_BUFFERS 2
 #define CLEAR(x) memset (&(x), 0, sizeof (x))
@@ -49,6 +50,11 @@ enum {
 static char *           dev_name[2]     = { NULL, NULL };
 static char *           rwpf_name[2]     = { NULL, NULL };
 static io_method        io              = IO_METHOD_MMAP;
+static uint32_t		format[2]	= { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_RGB565 };
+static enum v4l2_mbus_pixelcode code[2]	= { V4L2_MBUS_FMT_AYUV8_1X32, V4L2_MBUS_FMT_ARGB8888_1X32 };
+static unsigned int     n_planes[2]     = { 2, 1 };
+static int		width[2]	= { 1280, 1280 };
+static int		height[2]	= { 720, 720 };
 static int              v4lout_fd       = -1;
 static int              v4lcap_fd       = -1;
 static int              v4lsub_fd[2]    = { -1, -1 };
@@ -57,7 +63,6 @@ static int              output_fd       = -1;
 struct buffer           buffers[2][N_BUFFERS][VIDEO_MAX_PLANES];
 struct v4l2_plane       planes[2][VIDEO_MAX_PLANES];
 static unsigned int     n_buffers[2]    = { 0, 0 };
-static unsigned int     n_planes[2]     = { 0, 0 };
 static const char *	ocstring[2]	= { "OUT" , "CAP" };
 
 static void
@@ -398,7 +403,7 @@ init_entity_pad (int fd, int index, uint32_t pad, uint32_t width, uint32_t heigh
 
 	
 static void
-init_device                     (int fd, int index, uint32_t captype, enum v4l2_buf_type buftype, uint32_t color)
+init_device                     (int fd, int index, uint32_t captype, enum v4l2_buf_type buftype)
 {
         struct v4l2_capability cap;
         struct v4l2_cropcap cropcap;
@@ -507,9 +512,9 @@ init_device                     (int fd, int index, uint32_t captype, enum v4l2_
         CLEAR (fmt);
 
         fmt.type                = buftype;
-        fmt.fmt.pix_mp.width       = 1280;
-        fmt.fmt.pix_mp.height      = 720;
-        fmt.fmt.pix_mp.pixelformat = color;
+        fmt.fmt.pix_mp.width       = width[index];
+        fmt.fmt.pix_mp.height      = height[index];
+        fmt.fmt.pix_mp.pixelformat = format[index];
         fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
 
         if (-1 == xioctl (fd, VIDIOC_S_FMT, &fmt)) {
@@ -522,10 +527,10 @@ init_device                     (int fd, int index, uint32_t captype, enum v4l2_
 	       (fmt.fmt.pix_mp.pixelformat >> 8) & 0xff,
 	       (fmt.fmt.pix_mp.pixelformat >> 16) & 0xff,
 	       (fmt.fmt.pix_mp.pixelformat >> 24) & 0xff,
-	       (color >> 0) & 0xff,
-	       (color >> 8) & 0xff,
-	       (color >> 16) & 0xff,
-	       (color >> 24) & 0xff);
+	       (format[index] >> 0) & 0xff,
+	       (format[index] >> 8) & 0xff,
+	       (format[index] >> 16) & 0xff,
+	       (format[index] >> 24) & 0xff);
 	printf("num_planes = %d\n", fmt.fmt.pix_mp.num_planes);
 	for (i=0; i<fmt.fmt.pix_mp.num_planes; i++) {
 		printf("plane_fmt[%d].sizeimage = %d\n",
@@ -636,23 +641,139 @@ usage                           (FILE *                 fp,
                  "-h | --help               Print this message\n"
                  "-d | --input_device name  Video device name for input [/dev/video0]\n"
                  "-D | --output_device name Video device name for output [/dev/video1]\n"
+                 "-c | --input_color \n"
+                 "-C | --output_color \n"
+                 "-s | --input_size \n"
+                 "-S | --output_size \n"
                  "-f | --input_file name    Specify a file to input\n"
                  "-F | --output_file name   Specify a file to output\n"
                  "",
                  argv[0]);
 }
 
-static const char short_options [] = "hd:D:f:F:";
+static const char short_options [] = "hc:C:d:D:f:F:s:S:";
 
 static const struct option
 long_options [] = {
         { "help",       no_argument,            NULL,           'h' },
+        { "input_color",     required_argument,      NULL,           'c' },
+        { "outout_color",     required_argument,      NULL,           'C' },
         { "input_device",     required_argument,      NULL,           'd' },
         { "outout_device",     required_argument,      NULL,           'D' },
         { "input_file",      required_argument,      NULL,           'f' },
         { "output_file",     required_argument,      NULL,           'F' },
+        { "input_size",     required_argument,      NULL,           's' },
+        { "outout_size",     required_argument,      NULL,           'S' },
         { 0, 0, 0, 0 }
 };
+
+struct sizes_t {
+	const char *name;
+	int w;
+	int h;
+};
+
+static const struct sizes_t sizes[] = {
+	{ "QCIF", 176,  144 },
+	{ "CIF",  352,  288 },
+	{ "QVGA", 320,  240 },
+	{ "VGA",  640,  480 },
+	{ "D1",   720,  480 },
+	{ "WVGA", 800,  480 },
+	{ "SVGA", 800,  600 },
+	{ "XGA",  1024, 768 },
+	{ "720p", 1280, 720 },
+	{ "SXGA", 1280, 1024 },
+	{ "1080p", 1920, 1080 },
+};
+
+static int set_size (char * arg, int * w, int * h)
+{
+	int nr_sizes = sizeof(sizes) / sizeof(sizes[0]);
+	int i;
+
+	if (!arg)
+		return -1;
+
+	for (i=0; i<nr_sizes; i++) {
+		if (!strcasecmp (arg, sizes[i].name)) {
+			*w = sizes[i].w;
+			*h = sizes[i].h;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static const char * show_size (int w, int h)
+{
+	int nr_sizes = sizeof(sizes) / sizeof(sizes[0]);
+	int i;
+
+	for (i=0; i<nr_sizes; i++) {
+		if (w == sizes[i].w && h == sizes[i].h)
+			return sizes[i].name;
+	}
+
+	return "";
+}
+
+struct extensions_t {
+	const char *ext;
+	uint32_t fourcc;
+	enum v4l2_mbus_pixelcode code;
+	int n_planes;
+};
+
+static const struct extensions_t exts[] = {
+	{ "RGB565",   V4L2_PIX_FMT_RGB565, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "rgb",      V4L2_PIX_FMT_RGB565, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "RGB888",   V4L2_PIX_FMT_RGB24, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "888",      V4L2_PIX_FMT_RGB24, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "BGR888",   V4L2_PIX_FMT_BGR24, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "RGBx888",  V4L2_PIX_FMT_RGB32, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "x888",     V4L2_PIX_FMT_RGB32, V4L2_MBUS_FMT_ARGB8888_1X32, 1 },
+	{ "YV12",     V4L2_PIX_FMT_YUV420M, V4L2_MBUS_FMT_AYUV8_1X32, 2 },
+	{ "NV12",     V4L2_PIX_FMT_NV12M, V4L2_MBUS_FMT_AYUV8_1X32, 2 },
+	{ "420",      V4L2_PIX_FMT_NV12M, V4L2_MBUS_FMT_AYUV8_1X32, 2 },
+	{ "yuv",      V4L2_PIX_FMT_NV12M, V4L2_MBUS_FMT_AYUV8_1X32, 2 },
+	{ "NV16",     V4L2_PIX_FMT_NV16M, V4L2_MBUS_FMT_AYUV8_1X32, 2 },
+	{ "UYVY",     V4L2_PIX_FMT_UYVY, V4L2_MBUS_FMT_AYUV8_1X32, 1 },
+};
+
+static int set_colorspace (char * arg, uint32_t * fourcc, enum v4l2_mbus_pixelcode *code, int *n_planes)
+{
+	int nr_exts = sizeof(exts) / sizeof(exts[0]);
+	int i;
+
+	if (!arg)
+		return -1;
+
+	for (i=0; i<nr_exts; i++) {
+		if (!strcasecmp (arg, exts[i].ext)) {
+			*fourcc = exts[i].fourcc;
+			*code = exts[i].code;
+			*n_planes = exts[i].n_planes;
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static const char * show_colorspace (uint32_t c)
+{
+	int nr_exts = sizeof(exts) / sizeof(exts[0]);
+	int i;
+
+	for (i=0; i<nr_exts; i++) {
+		if (c == exts[i].fourcc)
+			return exts[i].ext;
+	}
+
+	return "<Unknown colorspace>";
+}
 
 int
 main                            (int                    argc,
@@ -679,6 +800,22 @@ main                            (int                    argc,
                 case 'h':
                         usage (stdout, argc, argv);
                         exit (EXIT_SUCCESS);
+
+		case 'c': /* input colorspace */
+			set_colorspace (optarg, &format[OUT], &code[OUT], &n_planes[OUT]);
+			break;
+
+		case 's': /* input size */
+			set_size (optarg, &width[OUT], &height[OUT]);
+			break;
+
+		case 'C': /* output colorspace */
+			set_colorspace (optarg, &format[CAP], &code[CAP], &n_planes[CAP]);
+			break;
+
+		case 'S': /* output size */
+			set_size (optarg, &width[CAP], &height[CAP]);
+			break;
 
                 case 'd':
                         dev_name[0] = optarg;
@@ -712,24 +849,20 @@ main                            (int                    argc,
 	list_formats(v4lcap_fd, CAP,
 		     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 #endif
-	n_planes[OUT] = 2;
         init_device (v4lout_fd, OUT,
 		     V4L2_CAP_VIDEO_OUTPUT_MPLANE,
-		     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
-		     V4L2_PIX_FMT_NV12M);
+		     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	/* sink pad in RPF */
-	init_entity_pad (v4lsub_fd[OUT], OUT, 0, 1280, 720, 0x2017);
+	init_entity_pad (v4lsub_fd[OUT], OUT, 0, width[OUT], height[OUT], code[OUT]);
 	/* source pad in RPF */
-	init_entity_pad (v4lsub_fd[OUT], OUT, 1, 1280, 720, 0x100d);
-	n_planes[CAP] = 1;
+	init_entity_pad (v4lsub_fd[OUT], OUT, 1, width[OUT], height[OUT], code[CAP]);
         init_device (v4lcap_fd, CAP,
 		     V4L2_CAP_VIDEO_CAPTURE_MPLANE,
-		     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-		     V4L2_PIX_FMT_RGB565);
+		     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	/* sink pad in WPF */
-	init_entity_pad (v4lsub_fd[CAP], CAP, 0, 1280, 720, 0x100d);
+	init_entity_pad (v4lsub_fd[CAP], CAP, 0, width[CAP], height[CAP], code[CAP]);
 	/* source pad in WPF */
-	init_entity_pad (v4lsub_fd[CAP], CAP, 1, 1280, 720, 0x100d);
+	init_entity_pad (v4lsub_fd[CAP], CAP, 1, width[CAP], height[CAP], code[CAP]);
 
         queue_buffers (v4lout_fd, OUT,
 		       V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
