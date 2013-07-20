@@ -24,6 +24,7 @@
 
 #include <asm/types.h>          /* for videodev2.h */
 
+#include <linux/media.h>
 #include <linux/videodev2.h>
 #include <linux/v4l2-subdev.h>
 #include <linux/v4l2-mediabus.h>
@@ -45,10 +46,12 @@ struct buffer {
 enum {
 	OUT = 0,
 	CAP = 1,
+	RESZ = 2,
 };
 
+static char *           ip_name         = NULL;
 static char *           dev_name[2]     = { NULL, NULL };
-static char *           rwpf_name[2]     = { NULL, NULL };
+static char *           entity_name[3]    = { NULL, NULL, "uds.0" };
 static io_method        io              = IO_METHOD_MMAP;
 static uint32_t		format[2]	= { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_RGB565 };
 static enum v4l2_mbus_pixelcode code[2]	= { V4L2_MBUS_FMT_AYUV8_1X32, V4L2_MBUS_FMT_ARGB8888_1X32 };
@@ -57,13 +60,15 @@ static int		width[2]	= { 1280, 1280 };
 static int		height[2]	= { 720, 720 };
 static int              v4lout_fd       = -1;
 static int              v4lcap_fd       = -1;
-static int              v4lsub_fd[2]    = { -1, -1 };
+static int              v4lsub_fd[3]    = { -1, -1, -1 };
+static int              media_fd        = -1;
 static int              input_fd        = -1;
 static int              output_fd       = -1;
 struct buffer           buffers[2][N_BUFFERS][VIDEO_MAX_PLANES];
 struct v4l2_plane       planes[2][VIDEO_MAX_PLANES];
 static unsigned int     n_buffers[2]    = { 0, 0 };
-static const char *	ocstring[2]	= { "OUT" , "CAP" };
+static const char *	ocstring[3]	= { "OUT" , "CAP", "RESZ" };
+static struct media_entity_desc entity[3];
 
 static void
 errno_exit                      (const char *           s, const char *s2)
@@ -398,10 +403,31 @@ init_entity_pad (int fd, int index, uint32_t pad, uint32_t width, uint32_t heigh
 	sfmt.format.colorspace = V4L2_COLORSPACE_SRGB;
 	
         if (-1 == xioctl (fd, VIDIOC_SUBDEV_S_FMT, &sfmt))
-                errno_exit ("VIDIOC_SUBDEV_S_FMT for ", rwpf_name[index]);
+                errno_exit ("VIDIOC_SUBDEV_S_FMT for ", entity_name[index]);
 }
 
-	
+static int
+open_v4lsubdev(char *prefix, char *target, char *path)
+{
+	int i;
+	char subdev_name[256];
+
+	for (i = 0; i < 255; i++) {
+		snprintf(path, 255, "/sys/class/video4linux/v4l-subdev%d/name", i);
+		if (fgets_with_openclose(path, subdev_name, 255) < 0)
+			break;
+		if (((prefix &&
+		      (strncmp(subdev_name, prefix, strlen(prefix)) == 0)) ||
+		     (prefix == NULL)) &&
+		    (strstr(subdev_name, target) != NULL)) {
+			snprintf(path, 255, "/dev/v4l-subdev%d", i);
+			return open (path, O_RDWR /* required | O_NONBLOCK */, 0);
+		}
+	}
+
+	return -1;
+}
+
 static void
 init_device                     (int fd, int index, uint32_t captype, enum v4l2_buf_type buftype)
 {
@@ -411,6 +437,7 @@ init_device                     (int fd, int index, uint32_t captype, enum v4l2_
         struct v4l2_format fmt;
         unsigned int min, i;
 	char *p;
+	char path[256];
 
         if (-1 == xioctl (fd, VIDIOC_QUERYCAP, &cap)) {
                 if (EINVAL == errno) {
@@ -423,36 +450,27 @@ init_device                     (int fd, int index, uint32_t captype, enum v4l2_
         }
 
 	/* look for a counterpart */
-	rwpf_name[index] = strdup(cap.card);
-	p = strstr(rwpf_name[index], index == OUT ? "input" : "output");
-	if (p == NULL) {
-		printf("index =%d\n", index);
-	        errno_exit ("unknown module name : ", cap.card);
+	p = strdup(cap.card);
+	p = strtok(p, " ");
+	if (ip_name == NULL) {
+		ip_name = p;
+		printf("ip_name = %s\n", ip_name);
+	} else if (strcmp(ip_name, p) != 0) {
+		errno_exit("ip name mismatch", NULL);
 	}
-	*(p - 1) = '\0';
-	printf("MODULE NAME[%d] = %s\n", index, rwpf_name[index]);
 
-	for (i = 0; i < 255; i++) {
-		char path[256], subdev_name[256];
+	entity_name[index] = strtok(NULL, " ");
+	if (entity_name[index] == NULL) {
+		errno_exit("entity name not found. in ", cap.card);
+	}
 
-		snprintf(path, 255, "/sys/class/video4linux/v4l-subdev%d/name", i);
-		if (fgets_with_openclose(path,
-					 subdev_name,
-					 255) < 0) {
-			printf("NO counterpart n = %d\n", i);
-			break;
-		}
-		if (strncmp(subdev_name, rwpf_name[index], strlen(rwpf_name[index])) == 0) {
-			snprintf(path, 255, "/dev/v4l-subdev%d", i);
-			printf("counterpart %s\n", path);
-			v4lsub_fd[index] = open (path, O_RDWR /* required | O_NONBLOCK */, 0);
-			if (v4lsub_fd[index] < 0) {
-		                fprintf (stderr, "Cannot open '%s': %d, %s\n",
-		                         path, errno, strerror (errno));
-		                exit (EXIT_FAILURE);
-			}
-			break;
-		}
+	printf("ENTITY NAME[%d] = %s\n", index, entity_name[index]);
+
+	v4lsub_fd[index] = open_v4lsubdev(ip_name, entity_name[index], path);
+	if (v4lsub_fd[index] < 0) {
+                fprintf (stderr, "Cannot open '%s': %d, %s\n",
+                         path, errno, strerror (errno));
+                exit (EXIT_FAILURE);
 	}
 
         if (!(cap.capabilities & captype)) {
@@ -610,6 +628,161 @@ open_device                     (char *name)
         }
 	printf("overhead for open() = %lf\n", t2 - t1);
 	return fd;
+}
+
+static int
+open_media_device                     (char *name)
+{
+        struct stat st;
+	char path[256];
+	int i;
+
+	for (i=0; i<256; i++) {
+		sprintf (path, "/sys/devices/platform/%s/media%d", name, i);
+		if (0 == stat (path, &st)) {
+			sprintf (path, "/dev/media%d", i);
+			printf("media device = %s\n", path);
+			return open (path, O_RDWR);
+		}
+	}
+
+        fprintf (stderr, "No media device for %s\n", name);
+	return -1;
+}
+
+static int
+get_media_entity (char *name, struct media_entity_desc *entity)
+{
+	int i, ret;
+
+	for (i=0; i<256; i++) {
+		CLEAR (*entity);
+		entity->id = i | MEDIA_ENT_ID_FLAG_NEXT;
+		ret = ioctl (media_fd, MEDIA_IOC_ENUM_ENTITIES, entity);
+		if (ret < 0) {
+			if (errno == EINVAL)
+				break;
+		} else if (strcmp(entity->name, name) == 0) {
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int
+activate_link (struct media_entity_desc *src, struct media_entity_desc *sink)
+{
+	struct media_links_enum links;
+	struct media_link_desc *target_link;
+	int pad_index, ret, i;
+
+	target_link = NULL;
+	CLEAR (links);
+	links.pads = malloc(sizeof(struct media_pad_desc) * src->pads);
+	links.links = malloc(sizeof(struct media_link_desc) * src->links);
+
+	links.entity = src->id;
+	ret = ioctl(media_fd, MEDIA_IOC_ENUM_LINKS, &links);
+
+	for (i=0; i<src->links; i++) {
+		pad_index = links.links[i].source.index;
+		if (links.pads[pad_index].flags & MEDIA_PAD_FL_SOURCE) {
+			if (links.links[i].sink.entity == sink->id) {
+				target_link = &links.links[i];
+			} else if (links.links[i].flags & MEDIA_LNK_FL_ENABLED) {
+				fprintf (stderr, "An active link to %02x found.\n",
+					 links.links[i].sink.entity);
+				return -1;
+			}
+		}
+	}
+
+	if (!target_link)
+		return -1;
+
+	target_link->flags |= MEDIA_LNK_FL_ENABLED;
+	return ioctl(media_fd, MEDIA_IOC_SETUP_LINK, target_link);
+}
+
+static int
+deactivate_link (struct media_entity_desc *src)
+{
+	struct media_links_enum links;
+	struct media_link_desc *target_link;
+	int pad_index, ret, i;
+
+	CLEAR (links);
+	links.pads = malloc(sizeof(struct media_pad_desc) * src->pads);
+	links.links = malloc(sizeof(struct media_link_desc) * src->links);
+
+	links.entity = src->id;
+	ret = ioctl(media_fd, MEDIA_IOC_ENUM_LINKS, &links);
+	if (ret)
+		return ret;
+
+	for (i=0; i<src->links; i++) {
+		pad_index = links.links[i].source.index;
+		if ((links.pads[pad_index].flags & MEDIA_PAD_FL_SOURCE) &&
+		    (links.links[i].flags & MEDIA_LNK_FL_ENABLED) &&
+		    !(links.links[i].flags & MEDIA_LNK_FL_IMMUTABLE)) {
+			struct media_entity_desc next;
+
+			target_link = &links.links[i];
+			CLEAR (next);
+			next.id = target_link->sink.entity;
+			ret = ioctl (media_fd, MEDIA_IOC_ENUM_ENTITIES, &next);
+			if (ret) {
+				fprintf (stderr, "ioctl(MEDIA_IOC_ENUM_ENTITIES, %d) failed.\n",
+					 target_link->sink.entity);
+				return ret;
+			}
+			ret = deactivate_link (&next);
+			if (ret)
+				fprintf (stderr, "deactivate_link(%s) failed.\n", next.name);
+			target_link->flags &= ~MEDIA_LNK_FL_ENABLED;
+			ret = ioctl(media_fd, MEDIA_IOC_SETUP_LINK, target_link);
+			printf ("A link from %s to %s deactivated.\n", src->name, next.name);
+		}
+	}
+
+	free (links.pads);
+	free (links.links);
+
+	return ret;
+}
+
+static int
+confirm_link (struct media_entity_desc *src, struct media_entity_desc *sink)
+{
+	struct media_links_enum links;
+	struct media_link_desc link;
+	int pad_index, ret, i;
+
+	printf("src.pads = %d, src.links = %d\n", src->pads, src->links);
+	CLEAR (links);
+	links.pads = malloc(sizeof(struct media_pad_desc) * src->pads);
+	links.links = malloc(sizeof(struct media_link_desc) * src->links);
+
+	links.entity = src->id;
+	ret = ioctl(media_fd, MEDIA_IOC_ENUM_LINKS, &links);
+
+	/* find a link to the sink entity */
+	for (i=0; i<src->links; i++) {
+		pad_index = links.links[i].source.index;
+		printf("pad_index = %d, links.links[%d].sink.entity = %d\n",
+		       pad_index, i, links.links[i].sink.entity);
+		if ((links.pads[pad_index].flags & MEDIA_PAD_FL_SOURCE) &&
+		    (links.links[i].sink.entity == sink->id)) {
+			printf("A link from entity-%d to entity-%d is %s!\n",
+			       src->id, sink->id,
+			       (links.links[i].flags & MEDIA_LNK_FL_ENABLED) ? "ENABLED" : "DISABLED");
+			return ((links.links[i].flags & MEDIA_LNK_FL_ENABLED) == 0);
+		}
+	}
+
+	printf("Link from entity-%d to entity-%d! not found.\n", src->id, sink->id);
+	return -1;
 }
 
 static void list_formats(int fd, int index, enum v4l2_buf_type buftype)
@@ -779,6 +952,9 @@ int
 main                            (int                    argc,
                                  char **                argv)
 {
+	int ret;
+	char tmp[256];
+
         dev_name[0] = "/dev/video0";
         dev_name[1] = "/dev/video1";
 
@@ -842,7 +1018,6 @@ main                            (int                    argc,
         v4lout_fd = open_device (dev_name[OUT]);
         v4lcap_fd = open_device (dev_name[CAP]);
 
-
 #if 1
 	list_formats(v4lout_fd, OUT,
 		     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
@@ -852,13 +1027,71 @@ main                            (int                    argc,
         init_device (v4lout_fd, OUT,
 		     V4L2_CAP_VIDEO_OUTPUT_MPLANE,
 		     V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
+
+        init_device (v4lcap_fd, CAP,
+		     V4L2_CAP_VIDEO_CAPTURE_MPLANE,
+		     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+	media_fd = open_media_device (ip_name);
+	if (media_fd < 0)
+		errno_exit ("cannot open a media file for ", ip_name);
+
+	sprintf(tmp, "%s %s", ip_name, entity_name[OUT]);
+	ret = get_media_entity (tmp, &entity[OUT]);
+	printf("ret = %d, entity[OUT] = %s\n", ret, entity[OUT].name);
+	sprintf(tmp, "%s %s", ip_name, entity_name[CAP]);
+	ret = get_media_entity (tmp, &entity[CAP]);
+	printf("ret = %d, entity[CAP] = %s\n", ret, entity[CAP].name);
+
+	/* Deactivate the current pipeline. */
+	deactivate_link (&entity[OUT]);
+
+	if ((width[OUT] != width[CAP]) || (height[OUT] != height[CAP])) {
+		char path[256];
+
+		v4lsub_fd[RESZ] = open_v4lsubdev (ip_name, entity_name[RESZ], path);
+		if (v4lsub_fd[RESZ] < 0)
+			errno_exit("cannot open a subdev file for ", entity_name[RESZ]);
+
+		sprintf(tmp, "%s %s", ip_name, entity_name[RESZ]);
+		ret = get_media_entity (tmp, &entity[RESZ]);
+		if (ret < 0) {
+			fprintf(stderr, "Entity for %s not found.\n", entity_name[RESZ]);
+			exit (EXIT_FAILURE);
+		}
+		printf("A entity for %s found.\n", entity_name[RESZ]);
+		ret = activate_link (&entity[OUT], &entity[RESZ]);
+		if (ret) {
+			fprintf(stderr, "Cannot enable a link from %s to %s\n",
+				entity_name[OUT], entity_name[RESZ]);
+			exit (EXIT_FAILURE);
+		}
+		printf("A link from %s to %s enabled.\n",
+		       entity_name[OUT], entity_name[RESZ]);
+		ret = activate_link (&entity[RESZ], &entity[CAP]);
+		if (ret) {
+			fprintf(stderr, "Cannot enable a link from %s to %s\n",
+				entity_name[RESZ], entity_name[CAP]);
+			exit (EXIT_FAILURE);
+		}
+		printf("A link from %s to %s enabled.\n",
+		       entity_name[RESZ], entity_name[CAP]);
+		init_entity_pad (v4lsub_fd[RESZ], RESZ, 0, width[OUT], height[OUT], code[CAP]);
+		init_entity_pad (v4lsub_fd[RESZ], RESZ, 1, width[CAP], height[CAP], code[CAP]);
+	} else {
+		ret = activate_link (&entity[OUT], &entity[CAP]);
+		if (ret) {
+			fprintf(stderr, "Cannot enable a link from %s to %s\n",
+			       entity_name[OUT], entity_name[CAP]);
+			exit (EXIT_FAILURE);
+		}
+		printf("A link from %s to %s enabled.\n",
+		       entity_name[OUT], entity_name[CAP]);
+	}
+
 	/* sink pad in RPF */
 	init_entity_pad (v4lsub_fd[OUT], OUT, 0, width[OUT], height[OUT], code[OUT]);
 	/* source pad in RPF */
 	init_entity_pad (v4lsub_fd[OUT], OUT, 1, width[OUT], height[OUT], code[CAP]);
-        init_device (v4lcap_fd, CAP,
-		     V4L2_CAP_VIDEO_CAPTURE_MPLANE,
-		     V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	/* sink pad in WPF */
 	init_entity_pad (v4lsub_fd[CAP], CAP, 0, width[CAP], height[CAP], code[CAP]);
 	/* source pad in WPF */
